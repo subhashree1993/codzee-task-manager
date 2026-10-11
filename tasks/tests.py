@@ -1,9 +1,69 @@
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from .models import Task
+
+
+class TaskStatusMigrationTests(TransactionTestCase):
+    def tearDown(self):
+        try:
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())
+        finally:
+            super().tearDown()
+
+    def test_legacy_statuses_are_normalized_without_changing_task_data(self):
+        migrate_from = [("tasks", "0002_alter_task_status")]
+        executor = MigrationExecutor(connection)
+        executor.migrate(migrate_from)
+        task_model = executor.loader.project_state(migrate_from).apps.get_model(
+            "tasks", "Task"
+        )
+
+        original_tasks = {}
+        for status_value in (
+            "pending",
+            "in_progress",
+            "completed",
+            "done",
+            "blocked",
+        ):
+            task = task_model.objects.create(
+                title=f"Task with {status_value} status",
+                description=f"Preserve details for {status_value}",
+                status=status_value,
+            )
+            original_tasks[task.pk] = (
+                task.title,
+                task.description,
+                status_value,
+            )
+
+        migrate_to = [("tasks", "0003_normalize_task_statuses")]
+        executor = MigrationExecutor(connection)
+        executor.migrate(migrate_to)
+        migrated_model = executor.loader.project_state(migrate_to).apps.get_model(
+            "tasks", "Task"
+        )
+        expected_statuses = {
+            "pending": "pending",
+            "in_progress": "in_progress",
+            "completed": "completed",
+            "done": "completed",
+            "blocked": "pending",
+        }
+
+        for task_id, (title, description, old_status) in original_tasks.items():
+            with self.subTest(old_status=old_status):
+                task = migrated_model.objects.get(pk=task_id)
+                self.assertEqual(task.title, title)
+                self.assertEqual(task.description, description)
+                self.assertEqual(task.status, expected_statuses[old_status])
 
 
 class TaskAPITests(APITestCase):
@@ -51,6 +111,53 @@ class TaskAPITests(APITestCase):
         self.assertEqual(task.status, "pending")
         self.assertEqual(response.data["description"], "")
         self.assertEqual(response.data["status"], "pending")
+
+    def test_create_rejects_invalid_status(self):
+        response = self.client.post(
+            self.list_url,
+            {"title": "Invalid status", "status": "blocked"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("status", response.data)
+        self.assertEqual(Task.objects.count(), 0)
+
+    def test_create_rejects_blank_and_whitespace_titles(self):
+        for title in ("", " \t\n"):
+            with self.subTest(title=repr(title)):
+                response = self.client.post(
+                    self.list_url, {"title": title}, format="json"
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn("title", response.data)
+        self.assertEqual(Task.objects.count(), 0)
+
+    def test_title_length_limit(self):
+        accepted_title = "T" * 200
+        accepted_response = self.client.post(
+            self.list_url, {"title": accepted_title}, format="json"
+        )
+
+        self.assertEqual(accepted_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(accepted_response.data["title"], accepted_title)
+
+        rejected_response = self.client.post(
+            self.list_url, {"title": "T" * 201}, format="json"
+        )
+
+        self.assertEqual(rejected_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("title", rejected_response.data)
+        self.assertEqual(Task.objects.count(), 1)
+
+    def test_create_trims_title_whitespace(self):
+        response = self.client.post(
+            self.list_url, {"title": "  Prepare interview  "}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["title"], "Prepare interview")
 
     def test_list_tasks_in_deterministic_newest_first_order(self):
         older = Task.objects.create(title="Older")
@@ -119,6 +226,26 @@ class TaskAPITests(APITestCase):
         self.assertEqual(task.title, "Original")
         self.assertEqual(task.description, "Keep these details")
         self.assertEqual(task.created_at, original_created_at)
+
+    def test_patch_rejects_invalid_values_without_modifying_task(self):
+        task = Task.objects.create(title="Original", status="pending")
+        invalid_payloads = (
+            {"status": "blocked"},
+            {"title": " \t\n"},
+            {"title": "T" * 201},
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                response = self.client.patch(
+                    self.detail_url(task), payload, format="json"
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn(next(iter(payload)), response.data)
+                task.refresh_from_db()
+                self.assertEqual(task.title, "Original")
+                self.assertEqual(task.status, "pending")
 
     def test_delete_task(self):
         task = Task.objects.create(title="Delete me")
