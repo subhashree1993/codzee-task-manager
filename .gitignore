@@ -61,6 +61,14 @@ cover/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite3-journal
+*.sqlite-wal
+*.sqlite3-wal
+*.sqlite-shm
+*.sqlite3-shm
 
 # Flask stuff:
 instance/
@@ -151,6 +159,7 @@ activemq-data/
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
