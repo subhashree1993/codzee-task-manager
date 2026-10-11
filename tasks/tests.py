@@ -12,6 +12,63 @@ from rest_framework.test import APIClient, APITestCase
 from .models import Task
 
 
+class TaskStatusMigrationTests(TransactionTestCase):
+    def tearDown(self):
+        try:
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())
+        finally:
+            super().tearDown()
+
+    def test_legacy_statuses_are_normalized_without_changing_task_data(self):
+        migrate_from = [("tasks", "0002_alter_task_status")]
+        executor = MigrationExecutor(connection)
+        executor.migrate(migrate_from)
+        task_model = executor.loader.project_state(migrate_from).apps.get_model(
+            "tasks", "Task"
+        )
+
+        original_tasks = {}
+        for status_value in (
+            "pending",
+            "in_progress",
+            "completed",
+            "done",
+            "blocked",
+        ):
+            task = task_model.objects.create(
+                title=f"Task with {status_value} status",
+                description=f"Preserve details for {status_value}",
+                status=status_value,
+            )
+            original_tasks[task.pk] = (
+                task.title,
+                task.description,
+                status_value,
+            )
+
+        migrate_to = [("tasks", "0003_normalize_task_statuses")]
+        executor = MigrationExecutor(connection)
+        executor.migrate(migrate_to)
+        migrated_model = executor.loader.project_state(migrate_to).apps.get_model(
+            "tasks", "Task"
+        )
+        expected_statuses = {
+            "pending": "pending",
+            "in_progress": "in_progress",
+            "completed": "completed",
+            "done": "completed",
+            "blocked": "pending",
+        }
+
+        for task_id, (title, description, old_status) in original_tasks.items():
+            with self.subTest(old_status=old_status):
+                task = migrated_model.objects.get(pk=task_id)
+                self.assertEqual(task.title, title)
+                self.assertEqual(task.description, description)
+                self.assertEqual(task.status, expected_statuses[old_status])
+
+
 class TaskAPITests(APITestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(
@@ -442,6 +499,21 @@ class TaskOwnershipMigrationTests(TransactionTestCase):
         self.assertEqual(migrated_task.title, "Existing owner's task")
         self.assertEqual(migrated_task.description, "Must remain unchanged")
         self.assertEqual(migrated_task.status, "in_progress")
+
+        credentials = base64.b64encode(
+            f"{generated_owner.username}:!".encode("utf-8")
+        ).decode("ascii")
+        client = APIClient()
+        response = client.patch(
+            reverse("task-detail", args=[migrated_task.pk]),
+            {"title": "Must remain unchanged"},
+            format="json",
+            HTTP_AUTHORIZATION=f"Basic {credentials}",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        migrated_task.refresh_from_db()
+        self.assertEqual(migrated_task.title, "Existing owner's task")
 
 
 class TaskBasicAuthenticationTests(APITestCase):

@@ -40,6 +40,9 @@ excluded from commits.
 | `created_at` | Timestamp generated on creation; read only. |
 | `owner` | Authenticated task owner; assigned by the server and read only. |
 
+The status migration preserves `pending`, `in_progress`, and `completed`, maps
+legacy `done` values to `completed`, and maps other unknown values to `pending`.
+
 All task endpoints require HTTP Basic Authentication. Each user can access only
 their own tasks. Lists are unpaginated and ordered by newest creation time, then
 descending ID. Filtering and pagination are planned for a later change.
