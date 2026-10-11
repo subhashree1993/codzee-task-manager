@@ -811,3 +811,85 @@ class TaskLegacyOwnerMarkerMigrationTests(TransactionTestCase):
         self.assertFalse(
             user_model.objects.filter(email=self.legacy_email).exists()
         )
+
+    def test_eligible_account_without_tasks_is_not_marked(self):
+        old_apps = self.migrate_tasks_to("0004_merge_status_and_owner")
+        user_model = old_apps.get_model("auth", "User")
+        task_model = old_apps.get_model("tasks", "Task")
+        self.assertFalse(
+            user_model.objects.filter(
+                username__regex=r"^legacy-task-owner(-[0-9]+)?$"
+            ).exists()
+        )
+
+        candidate = user_model.objects.create(
+            username="legacy-task-owner",
+            email="",
+            password="!",
+            is_active=False,
+        )
+        self.assertFalse(task_model.objects.filter(owner_id=candidate.pk).exists())
+
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        repaired_candidate = new_apps.get_model("auth", "User").objects.get(
+            pk=candidate.pk
+        )
+
+        self.assertEqual(repaired_candidate.email, "")
+
+    def test_whitespace_email_with_owned_task_is_marked_without_changing_task(self):
+        old_apps = self.migrate_tasks_to("0004_merge_status_and_owner")
+        user_model = old_apps.get_model("auth", "User")
+        task_model = old_apps.get_model("tasks", "Task")
+        candidate = user_model.objects.create(
+            username="legacy-task-owner",
+            email=" ",
+            password="!",
+            is_active=False,
+        )
+        task = task_model.objects.create(
+            title="Whitespace email legacy task",
+            description="Keep task values intact",
+            status="in_progress",
+            owner_id=candidate.pk,
+        )
+        original_task = (
+            task.title,
+            task.description,
+            task.status,
+            task.owner_id,
+        )
+
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        new_user_model = new_apps.get_model("auth", "User")
+        new_task_model = new_apps.get_model("tasks", "Task")
+        repaired_candidate = new_user_model.objects.get(pk=candidate.pk)
+        unchanged_task = new_task_model.objects.get(pk=task.pk)
+
+        self.assertEqual(repaired_candidate.email, self.legacy_email)
+        self.assertEqual(
+            (
+                unchanged_task.title,
+                unchanged_task.description,
+                unchanged_task.status,
+                unchanged_task.owner_id,
+            ),
+            original_task,
+        )
+
+    def test_whitespace_email_without_tasks_is_unchanged(self):
+        old_apps = self.migrate_tasks_to("0004_merge_status_and_owner")
+        user_model = old_apps.get_model("auth", "User")
+        candidate = user_model.objects.create(
+            username="legacy-task-owner",
+            email=" ",
+            password="!",
+            is_active=False,
+        )
+
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        unchanged_candidate = new_apps.get_model("auth", "User").objects.get(
+            pk=candidate.pk
+        )
+
+        self.assertEqual(unchanged_candidate.email, " ")
