@@ -877,19 +877,40 @@ class TaskLegacyOwnerMarkerMigrationTests(TransactionTestCase):
             original_task,
         )
 
-    def test_whitespace_email_without_tasks_is_unchanged(self):
+    def test_whitespace_email_without_owned_tasks_ignores_other_owners_tasks(self):
         old_apps = self.migrate_tasks_to("0004_merge_status_and_owner")
         user_model = old_apps.get_model("auth", "User")
+        task_model = old_apps.get_model("tasks", "Task")
         candidate = user_model.objects.create(
             username="legacy-task-owner",
             email=" ",
             password="!",
             is_active=False,
         )
-
-        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
-        unchanged_candidate = new_apps.get_model("auth", "User").objects.get(
-            pk=candidate.pk
+        other_owner = user_model.objects.create(
+            username="unrelated-user",
+            email="unrelated@example.com",
+            password="usable-password-hash",
+            is_active=True,
+        )
+        other_task = task_model.objects.create(
+            title="Another user's task",
+            description="Not owned by the legacy candidate",
+            status="pending",
+            owner_id=other_owner.pk,
         )
 
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        new_user_model = new_apps.get_model("auth", "User")
+        new_task_model = new_apps.get_model("tasks", "Task")
+        unchanged_candidate = new_user_model.objects.get(pk=candidate.pk)
+        unchanged_owner = new_user_model.objects.get(pk=other_owner.pk)
+        unchanged_task = new_task_model.objects.get(pk=other_task.pk)
+
         self.assertEqual(unchanged_candidate.email, " ")
+        self.assertEqual(unchanged_owner.email, "unrelated@example.com")
+        self.assertEqual(unchanged_task.owner_id, other_owner.pk)
+        self.assertEqual(unchanged_task.title, "Another user's task")
+        self.assertEqual(
+            unchanged_task.description, "Not owned by the legacy candidate"
+        )
