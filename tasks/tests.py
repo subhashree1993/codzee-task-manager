@@ -52,6 +52,53 @@ class TaskAPITests(APITestCase):
         self.assertEqual(response.data["description"], "")
         self.assertEqual(response.data["status"], "pending")
 
+    def test_create_rejects_invalid_status(self):
+        response = self.client.post(
+            self.list_url,
+            {"title": "Invalid status", "status": "blocked"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("status", response.data)
+        self.assertEqual(Task.objects.count(), 0)
+
+    def test_create_rejects_blank_and_whitespace_titles(self):
+        for title in ("", " \t\n"):
+            with self.subTest(title=repr(title)):
+                response = self.client.post(
+                    self.list_url, {"title": title}, format="json"
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn("title", response.data)
+        self.assertEqual(Task.objects.count(), 0)
+
+    def test_title_length_limit(self):
+        accepted_title = "T" * 200
+        accepted_response = self.client.post(
+            self.list_url, {"title": accepted_title}, format="json"
+        )
+
+        self.assertEqual(accepted_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(accepted_response.data["title"], accepted_title)
+
+        rejected_response = self.client.post(
+            self.list_url, {"title": "T" * 201}, format="json"
+        )
+
+        self.assertEqual(rejected_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("title", rejected_response.data)
+        self.assertEqual(Task.objects.count(), 1)
+
+    def test_create_trims_title_whitespace(self):
+        response = self.client.post(
+            self.list_url, {"title": "  Prepare interview  "}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["title"], "Prepare interview")
+
     def test_list_tasks_in_deterministic_newest_first_order(self):
         older = Task.objects.create(title="Older")
         newer = Task.objects.create(title="Newer")
@@ -119,6 +166,26 @@ class TaskAPITests(APITestCase):
         self.assertEqual(task.title, "Original")
         self.assertEqual(task.description, "Keep these details")
         self.assertEqual(task.created_at, original_created_at)
+
+    def test_patch_rejects_invalid_values_without_modifying_task(self):
+        task = Task.objects.create(title="Original", status="pending")
+        invalid_payloads = (
+            {"status": "blocked"},
+            {"title": " \t\n"},
+            {"title": "T" * 201},
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                response = self.client.patch(
+                    self.detail_url(task), payload, format="json"
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn(next(iter(payload)), response.data)
+                task.refresh_from_db()
+                self.assertEqual(task.title, "Original")
+                self.assertEqual(task.status, "pending")
 
     def test_delete_task(self):
         task = Task.objects.create(title="Delete me")
