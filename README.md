@@ -58,18 +58,41 @@ encrypted; use HTTPS outside local development.
 
 The ownership migration assigns pre-existing tasks to an inactive account named
 `legacy-task-owner` (with a numeric suffix if that username is already taken).
-Those tasks remain hidden from normal users. To reassign them locally, open
-`manage.py shell` and run the following, replacing the username with an active
-account:
+Those tasks remain hidden from normal users. To reassign them locally, first
+inspect the exact candidate account IDs in `manage.py shell`:
 
 ```python
 from django.contrib.auth import get_user_model
 from tasks.models import Task
 
-user = get_user_model().objects.get(username="your-username")
-Task.objects.filter(owner__username__startswith="legacy-task-owner").update(
-  owner=user
-)
+User = get_user_model()
+candidates = User.objects.filter(
+  email="legacy-task-owner@codzee.invalid",
+  is_active=False,
+  password="!",
+).order_by("pk")
+for candidate in candidates:
+  print({
+    "id": candidate.pk,
+    "username": candidate.username,
+    "active": candidate.is_active,
+    "has_usable_password": candidate.has_usable_password(),
+    "task_count": Task.objects.filter(owner_id=candidate.pk).count(),
+  })
+```
+
+Manually verify the exact account marked by the migration. It must be inactive,
+have an unusable password, and own the expected legacy tasks. If there is not
+exactly one matching account, stop and do not reassign. After confirming the
+printed ID, replace `LEGACY_OWNER_ID` below with that integer and the
+destination username with an active account:
+
+```python
+legacy_owner = User.objects.get(pk=LEGACY_OWNER_ID)
+assert not legacy_owner.is_active
+assert not legacy_owner.has_usable_password()
+destination = User.objects.get(username="your-active-username")
+Task.objects.filter(owner_id=legacy_owner.pk).update(owner_id=destination.pk)
 ```
 
 | Method | URL | Successful result |

@@ -4,6 +4,7 @@ import django.db.models.deletion
 
 
 LEGACY_USERNAME = "legacy-task-owner"
+LEGACY_EMAIL = "legacy-task-owner@codzee.invalid"
 
 
 def assign_legacy_owner(apps, schema_editor):
@@ -23,6 +24,7 @@ def assign_legacy_owner(apps, schema_editor):
 
     legacy_owner = User.objects.using(database).create(
         username=username,
+        email=LEGACY_EMAIL,
         password="!",
         is_active=False,
     )

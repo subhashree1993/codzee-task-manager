@@ -7,7 +7,7 @@ from django.test import TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from .models import Task
 
@@ -138,17 +138,6 @@ class TaskAPITests(APITestCase):
         task.refresh_from_db()
         self.assertEqual(Task.objects.count(), 1)
         self.assertEqual(task.title, "Private task")
-
-    def test_basic_authentication_accepts_valid_credentials(self):
-        credentials = base64.b64encode(b"task-owner:test-password").decode("ascii")
-        self.client.force_authenticate(user=None)
-
-        response = self.client.get(
-            self.list_url,
-            HTTP_AUTHORIZATION=f"Basic {credentials}",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_create_uses_authenticated_owner_and_ignores_submitted_owner(self):
         other_user = get_user_model().objects.create_user(
@@ -371,24 +360,176 @@ class TaskAPITests(APITestCase):
 
 
 class TaskOwnershipMigrationTests(TransactionTestCase):
-    def test_existing_tasks_are_assigned_to_an_inactive_legacy_owner(self):
-        migrate_from = [("tasks", "0002_alter_task_status")]
-        migrate_to = [("tasks", "0003_task_owner")]
+    def tearDown(self):
+        try:
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())
+        finally:
+            super().tearDown()
 
+    def migrate_from_pre_ownership(self):
+        migrate_from = [("tasks", "0002_alter_task_status")]
         executor = MigrationExecutor(connection)
         executor.migrate(migrate_from)
-        old_apps = executor.loader.project_state(migrate_from).apps
+        other_apps = [
+            node
+            for node in executor.loader.graph.leaf_nodes()
+            if node[0] != "tasks"
+        ]
+        return executor.loader.project_state(other_apps + migrate_from).apps
+
+    def migrate_to_ownership(self):
+        migrate_to = [("tasks", "0003_task_owner")]
+        executor = MigrationExecutor(connection)
+        executor.migrate(migrate_to)
+        other_apps = [
+            node
+            for node in executor.loader.graph.leaf_nodes()
+            if node[0] != "tasks"
+        ]
+        return executor.loader.project_state(other_apps + migrate_to).apps
+
+    def test_no_username_collision_uses_exact_legacy_username(self):
+        old_apps = self.migrate_from_pre_ownership()
         old_task_model = old_apps.get_model("tasks", "Task")
         legacy_task = old_task_model.objects.create(title="Pre-ownership task")
 
-        executor = MigrationExecutor(connection)
-        executor.migrate(migrate_to)
-        new_apps = executor.loader.project_state(migrate_to).apps
+        new_apps = self.migrate_to_ownership()
         new_task_model = new_apps.get_model("tasks", "Task")
         user_model = new_apps.get_model("auth", "User")
 
         migrated_task = new_task_model.objects.get(pk=legacy_task.pk)
         legacy_owner = user_model.objects.get(pk=migrated_task.owner_id)
-        self.assertTrue(legacy_owner.username.startswith("legacy-task-owner"))
+        self.assertEqual(legacy_owner.username, "legacy-task-owner")
+        self.assertEqual(legacy_owner.email, "legacy-task-owner@codzee.invalid")
         self.assertFalse(legacy_owner.is_active)
         self.assertEqual(legacy_owner.password, "!")
+        self.assertEqual(migrated_task.title, "Pre-ownership task")
+
+    def test_username_collision_uses_suffix_and_preserves_existing_user(self):
+        old_apps = self.migrate_from_pre_ownership()
+        old_task_model = old_apps.get_model("tasks", "Task")
+        old_user_model = old_apps.get_model("auth", "User")
+        existing_user = old_user_model.objects.create(
+            username="legacy-task-owner",
+            email="real-user@example.com",
+            password="existing-password-hash",
+            is_active=True,
+        )
+        legacy_task = old_task_model.objects.create(
+            title="Existing owner's task",
+            description="Must remain unchanged",
+            status="in_progress",
+        )
+
+        new_apps = self.migrate_to_ownership()
+        new_task_model = new_apps.get_model("tasks", "Task")
+        user_model = new_apps.get_model("auth", "User")
+
+        preserved_user = user_model.objects.get(pk=existing_user.pk)
+        self.assertEqual(preserved_user.username, "legacy-task-owner")
+        self.assertEqual(preserved_user.email, "real-user@example.com")
+        self.assertEqual(preserved_user.password, "existing-password-hash")
+        self.assertTrue(preserved_user.is_active)
+
+        migrated_task = new_task_model.objects.get(pk=legacy_task.pk)
+        generated_owner = user_model.objects.get(pk=migrated_task.owner_id)
+        self.assertEqual(generated_owner.username, "legacy-task-owner-1")
+        self.assertEqual(generated_owner.email, "legacy-task-owner@codzee.invalid")
+        self.assertFalse(generated_owner.is_active)
+        self.assertEqual(generated_owner.password, "!")
+        self.assertNotEqual(generated_owner.pk, existing_user.pk)
+        self.assertEqual(migrated_task.title, "Existing owner's task")
+        self.assertEqual(migrated_task.description, "Must remain unchanged")
+        self.assertEqual(migrated_task.status, "in_progress")
+
+
+class TaskBasicAuthenticationTests(APITestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = get_user_model().objects.create_user(
+            username="basic-user", password="correct-password"
+        )
+        self.task = Task.objects.create(title="Protected task", owner=self.user)
+        self.list_url = reverse("task-list")
+        self.detail_url = reverse("task-detail", args=[self.task.pk])
+
+    def basic_auth_headers(self, username, password):
+        credentials = base64.b64encode(
+            f"{username}:{password}".encode("utf-8")
+        ).decode("ascii")
+        return {"HTTP_AUTHORIZATION": f"Basic {credentials}"}
+
+    def assert_rejected_basic_auth_cannot_mutate_tasks(self, username, password):
+        headers = self.basic_auth_headers(username, password)
+        responses = (
+            self.client.get(self.list_url, **headers),
+            self.client.post(
+                self.list_url,
+                {"title": "Must not be created"},
+                format="json",
+                **headers,
+            ),
+            self.client.put(
+                self.detail_url,
+                {"title": "Must not be changed"},
+                format="json",
+                **headers,
+            ),
+            self.client.patch(
+                self.detail_url,
+                {"title": "Must not be changed"},
+                format="json",
+                **headers,
+            ),
+            self.client.delete(self.detail_url, **headers),
+        )
+
+        for response in responses:
+            with self.subTest(status_code=response.status_code):
+                self.assertEqual(
+                    response.status_code, status.HTTP_401_UNAUTHORIZED
+                )
+
+        self.task.refresh_from_db()
+        self.assertEqual(Task.objects.count(), 1)
+        self.assertEqual(self.task.title, "Protected task")
+        self.assertEqual(self.task.owner, self.user)
+
+    def test_valid_basic_credentials_are_accepted(self):
+        response = self.client.get(
+            self.list_url,
+            **self.basic_auth_headers("basic-user", "correct-password"),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_incorrect_password_returns_401_without_mutations(self):
+        self.assert_rejected_basic_auth_cannot_mutate_tasks(
+            "basic-user", "incorrect-password"
+        )
+
+    def test_inactive_user_returns_401_without_mutations(self):
+        inactive_user = get_user_model().objects.create_user(
+            username="inactive-user",
+            password="valid-password",
+            is_active=False,
+        )
+        self.assertTrue(inactive_user.has_usable_password())
+
+        self.assert_rejected_basic_auth_cannot_mutate_tasks(
+            "inactive-user", "valid-password"
+        )
+
+    def test_unusable_password_user_returns_401_without_mutations(self):
+        legacy_user = get_user_model().objects.create(
+            username="legacy-task-owner",
+            email="legacy-task-owner@codzee.invalid",
+            password="!",
+            is_active=False,
+        )
+        self.assertFalse(legacy_user.has_usable_password())
+
+        self.assert_rejected_basic_auth_cannot_mutate_tasks(
+            "legacy-task-owner", "!"
+        )
