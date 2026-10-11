@@ -605,3 +605,209 @@ class TaskBasicAuthenticationTests(APITestCase):
         self.assert_rejected_basic_auth_cannot_mutate_tasks(
             "legacy-task-owner", "!"
         )
+
+
+class TaskLegacyOwnerMarkerMigrationTests(TransactionTestCase):
+    legacy_email = "legacy-task-owner@codzee.invalid"
+
+    def tearDown(self):
+        try:
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())
+        finally:
+            super().tearDown()
+
+    def migrate_tasks_to(self, migration_name):
+        target = [("tasks", migration_name)]
+        executor = MigrationExecutor(connection)
+        executor.migrate(target)
+        other_apps = [
+            node
+            for node in executor.loader.graph.leaf_nodes()
+            if node[0] != "tasks"
+        ]
+        return executor.loader.project_state(other_apps + target).apps
+
+    def test_original_blank_email_account_is_repaired_without_other_changes(self):
+        old_apps = self.migrate_tasks_to("0004_merge_status_and_owner")
+        user_model = old_apps.get_model("auth", "User")
+        task_model = old_apps.get_model("tasks", "Task")
+
+        legacy_owner = user_model.objects.create(
+            username="legacy-task-owner-1",
+            email="",
+            password="!",
+            is_active=False,
+        )
+        legacy_task = task_model.objects.create(
+            title="Original legacy task",
+            description="Keep this description",
+            status="completed",
+            owner_id=legacy_owner.pk,
+        )
+        original_task = (
+            legacy_task.title,
+            legacy_task.description,
+            legacy_task.status,
+            legacy_task.owner_id,
+        )
+        original_tasks = {legacy_task.pk: original_task}
+
+        unrelated_accounts = [
+            user_model.objects.create(
+                username="legacy-task-owner-2",
+                email="",
+                password="!",
+                is_active=True,
+            ),
+            user_model.objects.create(
+                username="legacy-task-owner-3",
+                email="",
+                password="usable-password-hash",
+                is_active=False,
+            ),
+            user_model.objects.create(
+                username="legacy-task-owner-4",
+                email="person@example.com",
+                password="!",
+                is_active=False,
+            ),
+            user_model.objects.create(
+                username="legacy-task-ownerish",
+                email="",
+                password="!",
+                is_active=False,
+            ),
+        ]
+        for account in unrelated_accounts:
+            task = task_model.objects.create(
+                title=f"Owned by {account.username}",
+                description="Unrelated task",
+                status="pending",
+                owner_id=account.pk,
+            )
+            original_tasks[task.pk] = (
+                task.title,
+                task.description,
+                task.status,
+                task.owner_id,
+            )
+        original_unrelated_accounts = {
+            account.pk: (account.username, account.email, account.password, account.is_active)
+            for account in unrelated_accounts
+        }
+
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        new_user_model = new_apps.get_model("auth", "User")
+        new_task_model = new_apps.get_model("tasks", "Task")
+
+        repaired_owner = new_user_model.objects.get(pk=legacy_owner.pk)
+        self.assertEqual(repaired_owner.email, self.legacy_email)
+        self.assertFalse(repaired_owner.is_active)
+        self.assertEqual(repaired_owner.password, "!")
+
+        for task_id, original in original_tasks.items():
+            with self.subTest(task_id=task_id):
+                task = new_task_model.objects.get(pk=task_id)
+                self.assertEqual(
+                    (task.title, task.description, task.status, task.owner_id),
+                    original,
+                )
+
+        for account_id, original in original_unrelated_accounts.items():
+            with self.subTest(account_id=account_id):
+                account = new_user_model.objects.get(pk=account_id)
+                self.assertEqual(
+                    (account.username, account.email, account.password, account.is_active),
+                    original,
+                )
+
+    def test_ambiguous_legacy_accounts_are_left_unmarked(self):
+        old_apps = self.migrate_tasks_to("0004_merge_status_and_owner")
+        user_model = old_apps.get_model("auth", "User")
+        task_model = old_apps.get_model("tasks", "Task")
+
+        candidate_ids = []
+        for username in ("legacy-task-owner", "legacy-task-owner-1"):
+            candidate = user_model.objects.create(
+                username=username,
+                email="",
+                password="!",
+                is_active=False,
+            )
+            candidate_ids.append(candidate.pk)
+            task_model.objects.create(
+                title=f"Owned by {username}",
+                description="Keep task data",
+                status="pending",
+                owner_id=candidate.pk,
+            )
+
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        new_user_model = new_apps.get_model("auth", "User")
+        new_task_model = new_apps.get_model("tasks", "Task")
+
+        for account_id in candidate_ids:
+            with self.subTest(account_id=account_id):
+                account = new_user_model.objects.get(pk=account_id)
+                self.assertEqual(account.email, "")
+                task = new_task_model.objects.get(owner_id=account_id)
+                self.assertEqual(task.title, f"Owned by {account.username}")
+                self.assertEqual(task.description, "Keep task data")
+
+    def test_already_marked_account_is_unchanged(self):
+        old_apps = self.migrate_tasks_to("0004_merge_status_and_owner")
+        user_model = old_apps.get_model("auth", "User")
+        task_model = old_apps.get_model("tasks", "Task")
+        account = user_model.objects.create(
+            username="legacy-task-owner",
+            email=self.legacy_email,
+            password="!",
+            is_active=False,
+        )
+        task = task_model.objects.create(
+            title="Already marked owner's task",
+            description="Keep this task",
+            status="pending",
+            owner_id=account.pk,
+        )
+        another_candidate = user_model.objects.create(
+            username="legacy-task-owner-1",
+            email="",
+            password="!",
+            is_active=False,
+        )
+        task_model.objects.create(
+            title="Another candidate's task",
+            description="Leave it alone when marker exists",
+            status="pending",
+            owner_id=another_candidate.pk,
+        )
+
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        new_user_model = new_apps.get_model("auth", "User")
+        new_task_model = new_apps.get_model("tasks", "Task")
+        marked_account = new_user_model.objects.get(pk=account.pk)
+        unchanged_task = new_task_model.objects.get(pk=task.pk)
+
+        self.assertEqual(marked_account.email, self.legacy_email)
+        self.assertFalse(marked_account.is_active)
+        self.assertEqual(marked_account.password, "!")
+        unchanged_candidate = new_user_model.objects.get(pk=another_candidate.pk)
+        self.assertEqual(unchanged_candidate.email, "")
+        self.assertEqual(unchanged_task.title, task.title)
+        self.assertEqual(unchanged_task.owner_id, account.pk)
+
+    def test_fresh_install_with_no_legacy_tasks_creates_no_marker_account(self):
+        old_apps = self.migrate_tasks_to("0001_initial")
+        old_apps.get_model("tasks", "Task").objects.all().delete()
+        old_apps.get_model("auth", "User").objects.all().delete()
+
+        new_apps = self.migrate_tasks_to("0005_repair_legacy_owner_email")
+        user_model = new_apps.get_model("auth", "User")
+        task_model = new_apps.get_model("tasks", "Task")
+
+        self.assertEqual(task_model.objects.count(), 0)
+        self.assertFalse(
+            user_model.objects.filter(email=self.legacy_email).exists()
+        )

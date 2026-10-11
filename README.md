@@ -61,33 +61,63 @@ encrypted; use HTTPS outside local development.
 
 The ownership migration assigns pre-existing tasks to an inactive account named
 `legacy-task-owner` (with a numeric suffix if that username is already taken).
-Those tasks remain hidden from normal users. To reassign them locally, first
-inspect the exact candidate account IDs in `manage.py shell`:
+An upgrade migration repairs the reserved email marker for an account left with
+a blank email by the original migration. It acts only when exactly one account
+has the exact generated username form (`legacy-task-owner` or a numeric suffix),
+is inactive, has an unusable password, has a blank email, and owns tasks. It
+preserves active accounts, usable passwords, and nonblank emails. If the marker
+already exists or multiple accounts qualify, the migration makes no change.
+
+Before any manual repair or reassignment, inspect unmarked candidates and their
+owned task IDs in `manage.py shell`:
 
 ```python
+import re
+
 from django.contrib.auth import get_user_model
 from tasks.models import Task
 
 User = get_user_model()
-candidates = User.objects.filter(
-  email="legacy-task-owner@codzee.invalid",
-  is_active=False,
-  password="!",
-).order_by("pk")
-for candidate in candidates:
-  print({
-    "id": candidate.pk,
-    "username": candidate.username,
-    "active": candidate.is_active,
-    "has_usable_password": candidate.has_usable_password(),
-    "task_count": Task.objects.filter(owner_id=candidate.pk).count(),
-  })
+legacy_username = re.compile(r"legacy-task-owner(?:-[0-9]+)?")
+for candidate in User.objects.filter(is_active=False, password__startswith="!"):
+    if legacy_username.fullmatch(candidate.username) is None:
+        continue
+    if (candidate.email or "").strip():
+        continue
+    print({
+        "id": candidate.pk,
+        "username": candidate.username,
+        "email": candidate.email,
+        "active": candidate.is_active,
+        "has_usable_password": candidate.has_usable_password(),
+        "task_ids": list(
+            Task.objects.filter(owner_id=candidate.pk).values_list("id", flat=True)
+        ),
+    })
 ```
 
-Manually verify the exact account marked by the migration. It must be inactive,
-have an unusable password, and own the expected legacy tasks. If there is not
-exactly one matching account, stop and do not reassign. After confirming the
-printed ID, replace `LEGACY_OWNER_ID` below with that integer and the
+If more than one unmarked account appears, do not choose based on the username
+alone. Verify the exact account and its task IDs against the pre-migration
+database or other authoritative records. If you cannot verify a single account,
+stop and leave the accounts and tasks unchanged. After verifying the exact ID,
+first confirm no other account already has the reserved marker. If a marker
+already exists, verify that account and its task IDs instead of marking another.
+You may set the marker explicitly only after those checks:
+
+```python
+legacy_owner = User.objects.get(pk=VERIFIED_LEGACY_OWNER_ID)
+assert re.fullmatch(r"legacy-task-owner(?:-[0-9]+)?", legacy_owner.username)
+assert not legacy_owner.is_active
+assert not legacy_owner.has_usable_password()
+assert not (legacy_owner.email or "").strip()
+assert not User.objects.filter(email="legacy-task-owner@codzee.invalid").exists()
+assert Task.objects.filter(owner_id=legacy_owner.pk).exists()
+legacy_owner.email = "legacy-task-owner@codzee.invalid"
+legacy_owner.save(update_fields=["email"])
+```
+
+Once the exact account is marked, reassignment uses its numeric owner ID, never
+a username prefix. Replace `LEGACY_OWNER_ID` with the verified integer and the
 destination username with an active account:
 
 ```python
