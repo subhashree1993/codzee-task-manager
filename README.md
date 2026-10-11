@@ -44,8 +44,47 @@ The status migration preserves `pending`, `in_progress`, and `completed`, maps
 legacy `done` values to `completed`, and maps other unknown values to `pending`.
 
 All task endpoints require HTTP Basic Authentication. Each user can access only
-their own tasks. Lists are unpaginated and ordered by newest creation time, then
-descending ID. Filtering and pagination are planned for a later change.
+their own tasks. Task lists support status filtering, case-insensitive search,
+and page-number pagination, ordered by newest creation time and then descending
+ID.
+
+### List filters and pagination
+
+Only `GET /api/tasks/` uses list query parameters:
+
+| Parameter | Behaviour |
+| --- | --- |
+| `status` | Optional exact status filter: `pending`, `in_progress`, or `completed`. Missing or empty means no status filter. Unknown nonempty values return 400 with a `status` error. |
+| `search` | Optional Unicode-aware, case-insensitive literal substring search across title and description. Surrounding whitespace is trimmed; missing or whitespace-only values disable search. |
+| `page` | One-based page number; defaults to 1. |
+| `page_size` | Results per page; defaults to 10 and is capped at 100. |
+
+Status and search filters combine with AND. Filtering happens before pagination,
+and all results and counts are scoped to the authenticated user.
+
+The list response is now an object rather than a bare array:
+
+```json
+{
+  "count": 1,
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": 1,
+      "title": "Prepare interview",
+      "description": "Review the assignment",
+      "status": "pending",
+      "created_at": "2026-10-12T12:00:00Z",
+      "owner": 1
+    }
+  ]
+}
+```
+
+An invalid page or page beyond the available range returns 404, following DRF's
+`PageNumberPagination` behavior. A nonnumeric or non-positive `page_size` falls
+back to the default; a value above 100 is capped at 100.
 
 ### Local authentication
 
@@ -55,7 +94,8 @@ Create a local account and enter a username and password when prompted:
 venv/bin/python manage.py createsuperuser
 ```
 
-Use those credentials with curl's `-u` option. Unauthenticated requests return
+Use the username-only form `curl -u your-username`; curl will prompt for the
+password. Unauthenticated requests return
 `401 Unauthorized`. Basic Authentication credentials are only encoded, not
 encrypted; use HTTPS outside local development.
 
@@ -142,12 +182,12 @@ The URLs include trailing slashes.
 
 ### Examples
 
-Pass `-u your-username:your-password` on each curl command below.
+Pass `-u your-username` on each curl command below; curl prompts for the password.
 
 Create a task:
 
 ```sh
-curl -i -u your-username:your-password -X POST http://127.0.0.1:8000/api/tasks/ \
+curl -i -u your-username -X POST http://127.0.0.1:8000/api/tasks/ \
   -H 'Content-Type: application/json' \
   -d '{"title":"Prepare interview","description":"Review the assignment","status":"pending"}'
 ```
@@ -157,21 +197,24 @@ following commands with the actual returned ID.
 
 ```sh
 # List and retrieve
-curl -u your-username:your-password http://127.0.0.1:8000/api/tasks/
-curl -u your-username:your-password http://127.0.0.1:8000/api/tasks/1/
+curl -u your-username http://127.0.0.1:8000/api/tasks/
+curl -u your-username http://127.0.0.1:8000/api/tasks/1/
+
+# Filter and search the authenticated user's tasks
+curl -u your-username 'http://127.0.0.1:8000/api/tasks/?status=pending&search=interview&page=1&page_size=10'
 
 # Update the task's editable fields
-curl -i -u your-username:your-password -X PUT http://127.0.0.1:8000/api/tasks/1/ \
+curl -i -u your-username -X PUT http://127.0.0.1:8000/api/tasks/1/ \
   -H 'Content-Type: application/json' \
   -d '{"title":"Prepare interview","description":"Run the tests","status":"in_progress"}'
 
 # Update only the status
-curl -i -u your-username:your-password -X PATCH http://127.0.0.1:8000/api/tasks/1/ \
+curl -i -u your-username -X PATCH http://127.0.0.1:8000/api/tasks/1/ \
   -H 'Content-Type: application/json' \
   -d '{"status":"completed"}'
 
 # Delete
-curl -i -u your-username:your-password -X DELETE http://127.0.0.1:8000/api/tasks/1/
+curl -i -u your-username -X DELETE http://127.0.0.1:8000/api/tasks/1/
 ```
 
 ## Checks and tests

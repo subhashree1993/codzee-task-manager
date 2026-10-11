@@ -1,4 +1,5 @@
 import base64
+from urllib.parse import parse_qs, urlparse
 
 from django.contrib.auth import get_user_model
 from django.db import connection
@@ -84,7 +85,10 @@ class TaskAPITests(APITestCase):
         response = self.client.get(self.list_url)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, [])
+        self.assertEqual(
+            response.data,
+            {"count": 0, "next": None, "previous": None, "results": []},
+        )
 
     def test_create_task(self):
         payload = {
@@ -236,7 +240,9 @@ class TaskAPITests(APITestCase):
 
         list_response = self.client.get(self.list_url)
         self.assertEqual(list_response.status_code, status.HTTP_200_OK)
-        self.assertEqual([item["id"] for item in list_response.data], [own_task.pk])
+        self.assertEqual(
+            [item["id"] for item in list_response.data["results"]], [own_task.pk]
+        )
 
         for method in ("get", "put", "patch", "delete"):
             with self.subTest(method=method):
@@ -257,13 +263,302 @@ class TaskAPITests(APITestCase):
         response = self.client.get(self.list_url)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual([item["id"] for item in response.data], [newer.pk, older.pk])
+        self.assertEqual(
+            [item["id"] for item in response.data["results"]],
+            [newer.pk, older.pk],
+        )
 
         # Equal timestamps must still have a stable order using the task ID.
         Task.objects.update(created_at=timezone.now())
         response = self.client.get(self.list_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual([item["id"] for item in response.data], [newer.pk, older.pk])
+        self.assertEqual(
+            [item["id"] for item in response.data["results"]],
+            [newer.pk, older.pk],
+        )
+
+    def test_status_filter_choices_and_empty_status(self):
+        tasks_by_status = {
+            status_value: Task.objects.create(
+                title=f"Task {status_value}", status=status_value, owner=self.user
+            )
+            for status_value, _label in Task.STATUS_CHOICES
+        }
+
+        for status_value, task in tasks_by_status.items():
+            with self.subTest(status=status_value):
+                response = self.client.get(self.list_url, {"status": status_value})
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.data["count"], 1)
+                self.assertEqual(
+                    [item["id"] for item in response.data["results"]], [task.pk]
+                )
+
+        for params in ({}, {"status": ""}):
+            with self.subTest(params=params):
+                response = self.client.get(self.list_url, params)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.data["count"], len(tasks_by_status))
+
+    def test_unknown_status_filter_returns_clear_error(self):
+        response = self.client.get(self.list_url, {"status": "blocked"})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("status", response.data)
+        self.assertIn("Choose a valid status", str(response.data["status"]))
+
+    def test_search_matches_title_and_description_case_insensitively(self):
+        title_match = Task.objects.create(
+            title="Interview preparation", owner=self.user
+        )
+        description_match = Task.objects.create(
+            title="Weekly review", description="INTERVIEW notes", owner=self.user
+        )
+        Task.objects.create(title="Unrelated", description="No match", owner=self.user)
+
+        response = self.client.get(self.list_url, {"search": "  interview  "})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            {item["id"] for item in response.data["results"]},
+            {title_match.pk, description_match.pk},
+        )
+
+    def test_search_is_unicode_case_insensitive_and_treats_metacharacters_literally(self):
+        title_match = Task.objects.create(
+            title="Élan + plans", owner=self.user
+        )
+        Task.objects.create(title="Élan plans", owner=self.user)
+        description_match = Task.objects.create(
+            title="Travel notes", description="CAFÉ and résumé", owner=self.user
+        )
+
+        title_response = self.client.get(self.list_url, {"search": "élan +"})
+        self.assertEqual(title_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(title_response.data["count"], 1)
+        self.assertEqual(title_response.data["results"][0]["id"], title_match.pk)
+
+        description_response = self.client.get(
+            self.list_url, {"search": "café and résumé"}
+        )
+        self.assertEqual(description_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(description_response.data["count"], 1)
+        self.assertEqual(
+            description_response.data["results"][0]["id"], description_match.pk
+        )
+
+    def test_blank_search_and_no_match(self):
+        first = Task.objects.create(title="First", owner=self.user)
+        second = Task.objects.create(title="Second", owner=self.user)
+
+        blank_response = self.client.get(self.list_url, {"search": " \t "})
+        self.assertEqual(blank_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(blank_response.data["count"], 2)
+        self.assertEqual(
+            {item["id"] for item in blank_response.data["results"]},
+            {first.pk, second.pk},
+        )
+
+        no_match_response = self.client.get(
+            self.list_url, {"search": "absent-term"}
+        )
+        self.assertEqual(no_match_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(no_match_response.data["count"], 0)
+        self.assertEqual(no_match_response.data["results"], [])
+        self.assertIsNone(no_match_response.data["next"])
+        self.assertIsNone(no_match_response.data["previous"])
+
+    def test_status_and_search_filters_combine_with_and(self):
+        expected = Task.objects.create(
+            title="Interview prep", status="pending", owner=self.user
+        )
+        other_pending_match = Task.objects.create(
+            title="Other prep",
+            description="Interview notes",
+            status="pending",
+            owner=self.user,
+        )
+        Task.objects.create(
+            title="Interview completed", status="completed", owner=self.user
+        )
+        Task.objects.create(title="Other", status="pending", owner=self.user)
+
+        response = self.client.get(
+            self.list_url, {"status": "pending", "search": "interview"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            {item["id"] for item in response.data["results"]},
+            {expected.pk, other_pending_match.pk},
+        )
+
+    def test_pagination_spans_multiple_pages_in_stable_order(self):
+        tasks = [
+            Task.objects.create(title=f"Task {index}", owner=self.user)
+            for index in range(5)
+        ]
+        Task.objects.filter(pk__in=[task.pk for task in tasks]).update(
+            created_at=timezone.now()
+        )
+        expected_ids = sorted((task.pk for task in tasks), reverse=True)
+
+        pages = [
+            self.client.get(self.list_url, {"page": page, "page_size": 2})
+            for page in (1, 2, 3)
+        ]
+
+        for response in pages:
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 5)
+        self.assertIsNone(pages[0].data["previous"])
+        self.assertIsNotNone(pages[0].data["next"])
+        self.assertIsNotNone(pages[1].data["previous"])
+        self.assertIsNotNone(pages[1].data["next"])
+        self.assertIsNotNone(pages[2].data["previous"])
+        self.assertIsNone(pages[2].data["next"])
+        actual_ids = [
+            item["id"]
+            for response in pages
+            for item in response.data["results"]
+        ]
+        self.assertEqual(actual_ids, expected_ids)
+
+    def test_default_and_capped_page_sizes_and_invalid_page_size(self):
+        tasks = [
+            Task.objects.create(title=f"Task {index}", owner=self.user)
+            for index in range(101)
+        ]
+
+        default_response = self.client.get(self.list_url)
+        self.assertEqual(default_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(default_response.data["results"]), 10)
+        self.assertIsNotNone(default_response.data["next"])
+
+        capped_response = self.client.get(self.list_url, {"page_size": 500})
+        self.assertEqual(capped_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(capped_response.data["count"], len(tasks))
+        self.assertEqual(len(capped_response.data["results"]), 100)
+        self.assertIsNotNone(capped_response.data["next"])
+
+        invalid_size_response = self.client.get(
+            self.list_url, {"page_size": "not-a-number"}
+        )
+        self.assertEqual(invalid_size_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(invalid_size_response.data["results"]), 10)
+
+        non_positive_size_response = self.client.get(
+            self.list_url, {"page_size": 0}
+        )
+        self.assertEqual(non_positive_size_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(non_positive_size_response.data["results"]), 10)
+
+    def test_invalid_page_returns_not_found(self):
+        Task.objects.create(title="Only task", owner=self.user)
+
+        for page in ("not-a-number", "2"):
+            with self.subTest(page=page):
+                response = self.client.get(
+                    self.list_url, {"page": page, "page_size": 1}
+                )
+                self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_pagination_links_preserve_status_and_search(self):
+        Task.objects.create(
+            title="Interview prep one", status="pending", owner=self.user
+        )
+        Task.objects.create(
+            title="Interview prep two", status="pending", owner=self.user
+        )
+        Task.objects.create(
+            title="Interview done", status="completed", owner=self.user
+        )
+
+        response = self.client.get(
+            self.list_url,
+            {"status": "pending", "search": "interview", "page_size": 1},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        next_query = parse_qs(urlparse(response.data["next"]).query)
+        self.assertEqual(next_query["status"], ["pending"])
+        self.assertEqual(next_query["search"], ["interview"])
+        self.assertEqual(next_query["page_size"], ["1"])
+        self.assertEqual(next_query["page"], ["2"])
+
+    def test_other_users_do_not_affect_filtered_counts_or_any_page(self):
+        own_tasks = [
+            Task.objects.create(
+                title=f"Shared interview {index}", status="pending", owner=self.user
+            )
+            for index in range(3)
+        ]
+        other_user = get_user_model().objects.create_user(
+            username="pagination-other", password="test-password"
+        )
+        other_tasks = [
+            Task.objects.create(
+                title=f"Shared interview other {index}",
+                status="pending",
+                owner=other_user,
+            )
+            for index in range(5)
+        ]
+
+        responses = [
+            self.client.get(
+                self.list_url,
+                {
+                    "status": "pending",
+                    "search": "shared interview",
+                    "page": page,
+                    "page_size": 2,
+                },
+            )
+            for page in (1, 2)
+        ]
+
+        own_ids = {task.pk for task in own_tasks}
+        other_ids = {task.pk for task in other_tasks}
+        returned_ids = set()
+        for response in responses:
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 3)
+            page_ids = {item["id"] for item in response.data["results"]}
+            self.assertTrue(page_ids <= own_ids)
+            self.assertTrue(page_ids.isdisjoint(other_ids))
+            returned_ids.update(page_ids)
+        self.assertEqual(returned_ids, own_ids)
+
+    def test_list_query_parameters_do_not_change_detail_crud(self):
+        task = Task.objects.create(
+            title="Detail remains accessible", status="pending", owner=self.user
+        )
+        url = (
+            f"{self.detail_url(task)}?status=unknown&search=no-match"
+            "&page=invalid&page_size=0"
+        )
+
+        retrieve_response = self.client.get(url)
+        self.assertEqual(retrieve_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(retrieve_response.data["id"], task.pk)
+
+        put_response = self.client.put(
+            url,
+            {"title": "Updated with PUT", "status": "pending"},
+            format="json",
+        )
+        self.assertEqual(put_response.status_code, status.HTTP_200_OK)
+
+        patch_response = self.client.patch(url, {"title": "Updated with PATCH"})
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
+
+        delete_response = self.client.delete(url)
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Task.objects.filter(pk=task.pk).exists())
 
     def test_retrieve_task(self):
         task = Task.objects.create(
