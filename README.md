@@ -38,12 +38,95 @@ excluded from commits.
 | `description` | Optional text; defaults to an empty string. |
 | `status` | One of `pending`, `in_progress`, or `completed`; defaults to `pending`. |
 | `created_at` | Timestamp generated on creation; read only. |
+| `owner` | Authenticated task owner; assigned by the server and read only. |
 
 The status migration preserves `pending`, `in_progress`, and `completed`, maps
 legacy `done` values to `completed`, and maps other unknown values to `pending`.
-This API currently allows anonymous access and returns an unpaginated list,
-ordered by newest creation time and then descending ID. Later changes add
-authentication and ownership, followed by filtering and pagination.
+
+All task endpoints require HTTP Basic Authentication. Each user can access only
+their own tasks. Lists are unpaginated and ordered by newest creation time, then
+descending ID. Filtering and pagination are planned for a later change.
+
+### Local authentication
+
+Create a local account and enter a username and password when prompted:
+
+```sh
+venv/bin/python manage.py createsuperuser
+```
+
+Use those credentials with curl's `-u` option. Unauthenticated requests return
+`401 Unauthorized`. Basic Authentication credentials are only encoded, not
+encrypted; use HTTPS outside local development.
+
+The ownership migration assigns pre-existing tasks to an inactive account named
+`legacy-task-owner` (with a numeric suffix if that username is already taken).
+An upgrade migration repairs the reserved email marker for an account left with
+a blank email by the original migration. It acts only when exactly one account
+has the exact generated username form (`legacy-task-owner` or a numeric suffix),
+is inactive, has an unusable password, has a blank email, and owns tasks. It
+preserves active accounts, usable passwords, and nonblank emails. If the marker
+already exists or multiple accounts qualify, the migration makes no change.
+
+Before any manual repair or reassignment, inspect unmarked candidates and their
+owned task IDs in `manage.py shell`:
+
+```python
+import re
+
+from django.contrib.auth import get_user_model
+from tasks.models import Task
+
+User = get_user_model()
+legacy_username = re.compile(r"legacy-task-owner(?:-[0-9]+)?")
+for candidate in User.objects.filter(is_active=False, password__startswith="!"):
+    if legacy_username.fullmatch(candidate.username) is None:
+        continue
+    if (candidate.email or "").strip():
+        continue
+    print({
+        "id": candidate.pk,
+        "username": candidate.username,
+        "email": candidate.email,
+        "active": candidate.is_active,
+        "has_usable_password": candidate.has_usable_password(),
+        "task_ids": list(
+            Task.objects.filter(owner_id=candidate.pk).values_list("id", flat=True)
+        ),
+    })
+```
+
+If more than one unmarked account appears, do not choose based on the username
+alone. Verify the exact account and its task IDs against the pre-migration
+database or other authoritative records. If you cannot verify a single account,
+stop and leave the accounts and tasks unchanged. After verifying the exact ID,
+first confirm no other account already has the reserved marker. If a marker
+already exists, verify that account and its task IDs instead of marking another.
+You may set the marker explicitly only after those checks:
+
+```python
+legacy_owner = User.objects.get(pk=VERIFIED_LEGACY_OWNER_ID)
+assert re.fullmatch(r"legacy-task-owner(?:-[0-9]+)?", legacy_owner.username)
+assert not legacy_owner.is_active
+assert not legacy_owner.has_usable_password()
+assert not (legacy_owner.email or "").strip()
+assert not User.objects.filter(email="legacy-task-owner@codzee.invalid").exists()
+assert Task.objects.filter(owner_id=legacy_owner.pk).exists()
+legacy_owner.email = "legacy-task-owner@codzee.invalid"
+legacy_owner.save(update_fields=["email"])
+```
+
+Once the exact account is marked, reassignment uses its numeric owner ID, never
+a username prefix. Replace `LEGACY_OWNER_ID` with the verified integer and the
+destination username with an active account:
+
+```python
+legacy_owner = User.objects.get(pk=LEGACY_OWNER_ID)
+assert not legacy_owner.is_active
+assert not legacy_owner.has_usable_password()
+destination = User.objects.get(username="your-active-username")
+Task.objects.filter(owner_id=legacy_owner.pk).update(owner_id=destination.pk)
+```
 
 | Method | URL | Successful result |
 | --- | --- | --- |
@@ -59,10 +142,12 @@ The URLs include trailing slashes.
 
 ### Examples
 
+Pass `-u your-username:your-password` on each curl command below.
+
 Create a task:
 
 ```sh
-curl -i -X POST http://127.0.0.1:8000/api/tasks/ \
+curl -i -u your-username:your-password -X POST http://127.0.0.1:8000/api/tasks/ \
   -H 'Content-Type: application/json' \
   -d '{"title":"Prepare interview","description":"Review the assignment","status":"pending"}'
 ```
@@ -72,21 +157,21 @@ following commands with the actual returned ID.
 
 ```sh
 # List and retrieve
-curl http://127.0.0.1:8000/api/tasks/
-curl http://127.0.0.1:8000/api/tasks/1/
+curl -u your-username:your-password http://127.0.0.1:8000/api/tasks/
+curl -u your-username:your-password http://127.0.0.1:8000/api/tasks/1/
 
 # Update the task's editable fields
-curl -i -X PUT http://127.0.0.1:8000/api/tasks/1/ \
+curl -i -u your-username:your-password -X PUT http://127.0.0.1:8000/api/tasks/1/ \
   -H 'Content-Type: application/json' \
   -d '{"title":"Prepare interview","description":"Run the tests","status":"in_progress"}'
 
 # Update only the status
-curl -i -X PATCH http://127.0.0.1:8000/api/tasks/1/ \
+curl -i -u your-username:your-password -X PATCH http://127.0.0.1:8000/api/tasks/1/ \
   -H 'Content-Type: application/json' \
   -d '{"status":"completed"}'
 
 # Delete
-curl -i -X DELETE http://127.0.0.1:8000/api/tasks/1/
+curl -i -u your-username:your-password -X DELETE http://127.0.0.1:8000/api/tasks/1/
 ```
 
 ## Checks and tests
@@ -98,7 +183,7 @@ venv/bin/python manage.py test --verbosity 2
 ```
 
 The API tests exercise creation, defaults, listing and stable ordering, retrieval,
-PUT, PATCH, deletion, missing tasks, required fields, and server-managed fields.
+PUT, PATCH, deletion, authentication, ownership, and server-managed fields.
 Django uses a separate test database; these tests do not modify your local tasks.
 The migration check verifies that committed migrations match the models.
 
