@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -14,6 +15,11 @@ class Task(models.Model):
         max_length=20, choices=STATUS_CHOICES, default="pending"
     )
     created_at = models.DateTimeField(auto_now_add=True)
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="tasks",
+    )
 
     def __str__(self):
         return self.title
