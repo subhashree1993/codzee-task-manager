@@ -325,6 +325,29 @@ class TaskAPITests(APITestCase):
             {title_match.pk, description_match.pk},
         )
 
+    def test_search_is_unicode_case_insensitive_and_treats_metacharacters_literally(self):
+        title_match = Task.objects.create(
+            title="Élan + plans", owner=self.user
+        )
+        Task.objects.create(title="Élan plans", owner=self.user)
+        description_match = Task.objects.create(
+            title="Travel notes", description="CAFÉ and résumé", owner=self.user
+        )
+
+        title_response = self.client.get(self.list_url, {"search": "élan +"})
+        self.assertEqual(title_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(title_response.data["count"], 1)
+        self.assertEqual(title_response.data["results"][0]["id"], title_match.pk)
+
+        description_response = self.client.get(
+            self.list_url, {"search": "café and résumé"}
+        )
+        self.assertEqual(description_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(description_response.data["count"], 1)
+        self.assertEqual(
+            description_response.data["results"][0]["id"], description_match.pk
+        )
+
     def test_blank_search_and_no_match(self):
         first = Task.objects.create(title="First", owner=self.user)
         second = Task.objects.create(title="Second", owner=self.user)

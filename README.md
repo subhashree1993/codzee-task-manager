@@ -55,7 +55,7 @@ Only `GET /api/tasks/` uses list query parameters:
 | Parameter | Behaviour |
 | --- | --- |
 | `status` | Optional exact status filter: `pending`, `in_progress`, or `completed`. Missing or empty means no status filter. Unknown nonempty values return 400 with a `status` error. |
-| `search` | Optional case-insensitive literal substring search across title and description. Surrounding whitespace is trimmed; missing or whitespace-only values disable search. |
+| `search` | Optional Unicode-aware, case-insensitive literal substring search across title and description. Surrounding whitespace is trimmed; missing or whitespace-only values disable search. |
 | `page` | One-based page number; defaults to 1. |
 | `page_size` | Results per page; defaults to 10 and is capped at 100. |
 

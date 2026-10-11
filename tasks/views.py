@@ -1,3 +1,5 @@
+import re
+
 from django.db.models import Q
 from rest_framework import permissions, viewsets
 from rest_framework.authentication import BasicAuthentication
@@ -41,9 +43,10 @@ class TaskViewSet(viewsets.ModelViewSet):
 
         search_term = self.request.query_params.get("search", "").strip()
         if search_term:
+            search_pattern = re.escape(search_term)
             queryset = queryset.filter(
-                Q(title__icontains=search_term)
-                | Q(description__icontains=search_term)
+                Q(title__iregex=search_pattern)
+                | Q(description__iregex=search_pattern)
             )
 
         return queryset
